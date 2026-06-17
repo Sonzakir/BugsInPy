@@ -84,17 +84,24 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ "$run_editable_install" == "1" ]]; then
     if [[ -f "$work_dir/setup.py" || -f "$work_dir/pyproject.toml" ]]; then
         echo "Running post-compile editable install"
-        set +e
+        # Call the venv's interpreter directly instead of source-ing the venv's
+        # activate/deactivate scripts. Under `set -u`, the venv deactivate hook can
+        # reference unbound variables and abort the script (not caught by `|| true`),
+        # which previously made compile fail spuriously even when the editable
+        # install succeeded. Using the venv python needs no activation.
         if [[ -d "$work_dir/env/Scripts" ]]; then
-            # shellcheck disable=SC1091
-            source "$work_dir/env/Scripts/activate"
+            venv_python="$work_dir/env/Scripts/python"
         else
-            # shellcheck disable=SC1091
-            source "$work_dir/env/bin/activate"
+            venv_python="$work_dir/env/bin/python"
         fi
-        python -m pip install -e . --no-deps
+        # Reuse the build-isolation constraints written by bugsinpy-compile so the
+        # project under test also builds against setuptools<60.
+        if [[ -f "$work_dir/bugsinpy_pip_constraints.txt" ]]; then
+            export PIP_CONSTRAINT="$work_dir/bugsinpy_pip_constraints.txt"
+        fi
+        set +e
+        "$venv_python" -m pip install -e "$work_dir" --no-deps
         editable_status=$?
-        deactivate >/dev/null 2>&1 || true
         set -e
 
         if [[ "$editable_status" -ne 0 ]]; then

@@ -119,96 +119,109 @@ done < "$work_dir/bugsinpy_bug.info"
   
   IFS=';' read -r -a run_setup <<< "$run_setup_all"
 
-###Run setup.sh
-#dos2unix $work_dir/bugsinpy_requirements.txt
-#pip install -r "$work_dir/bugsinpy_requirements.txt"
-if grep -q '[^[:space:]]' "$work_dir/bugsinpy_requirements.txt"; then
-    sed -e '/^\s*#.*$/d' -e '/^\s*$/d' $work_dir/bugsinpy_requirements.txt | xargs -I {} pip install {}
-fi
+###Prepare a modern, resolved install environment.
+# BugsInPy requirements are a pip-freeze snapshot. Installing them line-by-line
+# (xargs pip install) gives NO cross-package resolution, leaves the env
+# inconsistent (wrong transitive versions), and chokes on lines carrying flags
+# (e.g. "-e git+..." is passed as one argv and rejected). Instead do ONE resolved
+# `pip install -r` after:
+#   * upgrading pip/wheel and pinning setuptools<60 -- period sdists such as
+#     numpy 1.18.4 use the removed distutils.msvccompiler / legacy setup.py paths
+#   * constraining build-isolation environments to the same old setuptools
+#   * normalising encoding and dropping lines pip cannot resolve here.
+python -m pip install --upgrade pip "setuptools<60" wheel
 
+# Drop unresolvable lines:
+#   - pywin32 / pypiwin32: Windows-only, no Linux distribution
+#   - pkg-resources==0.0.0: Debian/Ubuntu pip-freeze artifact, not a real package
+#   - "-e git+..." self references: the project under test is installed later by
+#     bugsinpy-safe-compile's editable step
+reqs_filtered="$work_dir/bugsinpy_requirements.filtered.txt"
+tr -d '\000' < "$work_dir/bugsinpy_requirements.txt" \
+  | sed -e 's/\r$//' -e '1s/^[^[:print:]]*//' \
+  | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+  | grep -ivE '^(pywin32|pypiwin32)([=<>!~ ]|$)' \
+  | grep -vE '^pkg-resources==0\.0\.0' \
+  | grep -vE '^[[:space:]]*-e[[:space:]]' \
+  > "$reqs_filtered"
+
+# Build constraints applied to EVERY pip invocation, including the isolated PEP 517
+# build environments. Pinning setuptools<60 keeps period sdists (numpy 1.18.4's
+# removed distutils.msvccompiler / legacy setup.py) buildable; echoing the project's
+# own "name==version" pins makes build backends use the SAME build deps the project
+# froze (e.g. Cython==0.29.19), so source builds like pandas 1.x's Cython extensions
+# don't pick up an incompatible modern Cython.
+constraints_file="$work_dir/bugsinpy_pip_constraints.txt"
+{
+    printf 'setuptools<60\nwheel\n'
+    grep -E '^[A-Za-z0-9_.-]+==[A-Za-z0-9_.*+!-]+[[:space:]]*$' "$reqs_filtered"
+} > "$constraints_file"
+export PIP_CONSTRAINT="$constraints_file"
+
+###Install requirement (resolved, with a resilient fallback).
+# Try one resolved `pip install -r` first. If it fails -- usually because a single
+# pin is yanked/unsatisfiable on PyPI, which aborts the whole resolved pass -- fall
+# back to a line-by-line install so the rest of the environment (including test
+# deps such as pytest) is still installed; genuinely unavailable pins are skipped
+# with a warning instead of sinking the whole compile.
+install_requirements() {
+    local reqs="$1"
+    grep -q '[^[:space:]]' "$reqs" || return 0
+    if pip install -r "$reqs"; then
+        return 0
+    fi
+    echo "Resolved install failed; falling back to line-by-line for $reqs" >&2
+    while IFS= read -r req; do
+        [ -z "$req" ] && continue
+        pip install "$req" || echo "WARNING: skipping unresolved requirement: $req" >&2
+    done < "$reqs"
+    return 0
+}
+
+install_requirements "$reqs_filtered"
+
+###Run setup.sh
 for index in "${!run_setup[@]}"
 do
-   run_setup_trail=${run_setup[index]} 
+   run_setup_trail=${run_setup[index]}
    run_setup_now=$(echo $run_setup_trail | sed -e 's/\r//g')
    $run_setup_now
 done
-  
-###Install requirement
-#pip install -r "$work_dir/bugsinpy_requirements.txt"
-if grep -q '[^[:space:]]' "$work_dir/bugsinpy_requirements.txt"; then
-    sed -e '/^\s*#.*$/d' -e '/^\s*$/d' $work_dir/bugsinpy_requirements.txt | xargs -I {} pip install {}
+
+###Re-install requirements in case setup.sh changed the environment
+install_requirements "$reqs_filtered"
+
+###Ensure the test runner is available.
+# Some bugs ship an empty/partial requirements snapshot that omits pytest even
+# though run_test.sh invokes it (e.g. matplotlib). Without this the test step
+# dies with "pytest: command not found" and the bug looks unusable.
+if grep -qiE 'pytest|py\.test' "$work_dir/bugsinpy_run_test.sh" 2>/dev/null; then
+    if ! python -c 'import pytest' >/dev/null 2>&1; then
+        echo "Test runner is pytest but it is not installed; installing pytest"
+        pip install pytest || echo "WARNING: could not install pytest" >&2
+    fi
 fi
 deactivate
 
 
 ###Add pythonpath
+# Persist PYTHONPATH into the venv's activate script so that BOTH this compile
+# step and bugsinpy-test (which activates env/) pick it up. This replaces the
+# legacy logic that rewrote ~/.bashrc -- bugsinpy-test never sources ~/.bashrc,
+# and that logic could append an unbalanced quote and corrupt ~/.bashrc, making
+# the whole compile fail. Writing to activate is idempotent and self-contained.
   if [ "$pythonpath_set" != "" ]; then
-     if [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
-        saveReply=""
-        pythonpath_exist="NO"
-        should_change="NO"
-        DONE=false
-        until $DONE ;do
-        read || DONE=true
-        if [[ "$pythonpath_exist" == "YES" ]]; then
-            if [[ "$REPLY" != "export PYTHONPATH"* ]]; then
-               should_change="YES"
-            fi
-            pythonpath_exist="YES1"
-        fi
-        if [[ "$REPLY" == "PYTHONPATH="* ]]; then
-            pythonpath_exist="YES"
-            tes='"'
-            if [[ "$REPLY" != *"$pythonpath_set:"* ]]; then
-               should_change="YES"
-               saveReply=$REPLY
-               string1="${REPLY%:*}"
-               string2="${REPLY##*:}"
-               if [[ "$string2" == *"PYTHONPATH"* ]]; then
-                  echo "$string1:$pythonpath_set:$string2"
-               else
-                  temp="$"
-                  temp_py="PYTHONPATH"
-                  temp2=${REPLY%$tes*}
-                  echo "$temp2:$pythonpath_set:$temp$temp_py$tes"
-               fi
-            fi
-        fi 
-        done <  ~/.bashrc 
-        if [[ "$pythonpath_exist" == "NO" ]]; then
-            should_change="NO"
-            temp_path_not_exist='PYTHONPATH="$pythonpath_set:$PYTHONPATH"'
-            echo "$temp_path_not_exist" >> ~/.bashrc 
-            echo "export PYTHONPATH" >> ~/.bashrc 
-            source ~/.bashrc
-        fi
-        if [[ "$should_change" == "YES" ]]; then
-            echo "SHOULD CHANGE"
-            sed -i.bak '/PYTHONPATH=/d' ~/.bashrc
-            if [[ "$pythonpath_exist" == "YES1" ]]; then
-                sed -i.bak '/export PYTHONPATH/d' ~/.bashrc
-            fi
-
-            
-            string1="${saveReply%:*}"
-            string2="${saveReply##*:}"
-            if [[ "$string2" == *"PYTHONPATH"* ]]; then
-               string1="${saveReply%%/*}"
-               string2="$(cut -d'"' -f 2 <<< $saveReply)"
-               delimeter='"'
-               echo "$pythonpath_set"
-               echo "$string1"
-               echo "$string1$pythonpath_set:$string2$delimeter" >> ~/.bashrc
-            else
-               temp="$"
-               temp_py="PYTHONPATH"
-               temp2=${saveReply%$tes*}
-               echo "$temp2:$pythonpath_set:$temp$temp_py$tes" >> ~/.bashrc
-            fi
-            echo "export PYTHONPATH" >> ~/.bashrc
-            source ~/.bashrc
-        fi
-      fi
+     activate_script="$work_dir/env/bin/activate"
+     if [ -f "$work_dir/env/Scripts/activate" ]; then
+        activate_script="$work_dir/env/Scripts/activate"
+     fi
+     if [ -f "$activate_script" ] && ! grep -q "# bugsinpy PYTHONPATH" "$activate_script"; then
+        {
+           echo ""
+           echo "# bugsinpy PYTHONPATH"
+           echo "export PYTHONPATH=\"$pythonpath_set:\${PYTHONPATH:-}\""
+        } >> "$activate_script"
+     fi
   fi
 
 

@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
     wget llvm libncursesw5-dev xz-utils tk-dev libxml2-dev \
     libxmlsec1-dev libffi-dev liblzma-dev ca-certificates \
+    libjpeg-dev libpng-dev libfreetype6-dev libxslt1-dev \
+    gfortran libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYENV_ROOT=/root/.pyenv
